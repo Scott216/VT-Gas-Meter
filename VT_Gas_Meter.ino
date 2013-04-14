@@ -3,7 +3,7 @@ This version uses COSM.h library to upload data.
 Version 3
 
 To do:
-* Add LCD Display to indicate activity: Pulse received, Successful upload to COSM, etc
+* Add LCD Display http://www.adafruit.com/products/931  to indicate activity: Pulse received, Successful upload to COSM, etc
 
 === When you create PCB shield ===
 one button to increase, another to decrease
@@ -97,18 +97,19 @@ COSM Datastreams:
 
 #include <SPI.h>        // Required for Ethernet as of Arduino 0021, ref: http://arduino.cc/en/Reference/SPI
 #include <Ethernet.h>   // Functions to control Ethernet shield Ref: http://www.arduino.cc/en/Reference/Ethernet
+#include <EthernetUdp.h>// core library
 #include <HttpClient.h> // used by Cosm.h  http://github.com/amcewen/HttpClient
 #include <avr/eeprom.h> // Functions to read/write EEPROM
 #include <Cosm.h>       // http://github.com/cosm/cosm-arduino
 #include <tokens.h>     // COSM API key
 #include <Time.h>       // http://www.pjrc.com/teensy/td_libs_Time.html#ntp
 #include <TimeAlarms.h> // http://code.google.com/p/arduino-time/source/browse/trunk/TimeAlarms/
-#include <EthernetUdp.h>// core library
 
 
 // #define PRER3ETHERNETSHLD // comment out if using R3 or later shield.  Older shields need a hard reset after power up
 #define CRESTVIEW         // If at Crestview, change IP, Feed ID and use internal pull-up resistors
 
+// #define USEDISPLAY       // Comment out if not using the OLED Display
 
 #define UPDATE_INTERVAL         20000   // If the connection is good wait 15 seconds before updating again - should not be less than 5 seconds per cosm requirements
 #define EEPROM_ADDR_GASPULSE        0   // Location in EEPROM where gas pulse will be saved (0-512 bytes)
@@ -131,10 +132,8 @@ const int timeZone = -5;  // Eastern Standard Time (USA)
 EthernetUDP Udp;
 unsigned int localPort = 8888;  // local port to listen for UDP packets
 
-
 uint8_t successes = 0;     // Cosm upload success counter, using a byte will make counter rollover at 255, which is what we want
 uint8_t failures  = 0;     // Cosm upload failure counter
-
 
 // Propane and pulses
 uint32_t MeterReading =             0;    // Reading on gas meter
@@ -155,7 +154,7 @@ uint32_t MeterStartDay =            0;    // Meter reading at begenning of day
 #define ledHeartbeatPin       4   // LED flashes quickly twice to indicate programming is not frozen 
 #define ResetEthernetPin      8   // Reset Ethernet shield
 #define ProtoWireShieldBtn    5   // Analog Input connected to button on protoshield - decreases pulse meter count
-
+// Use D6 for OLED reset
 
 
 // Define Cosm datastreem IDs.  cosm.h requires this to ba a string
@@ -195,6 +194,7 @@ EthernetClient client;
 CosmClient cosmclient(client);
 
 uint32_t next_connect;   // Timer for uploading to COSM
+char lcdBuff[22];  // character buffer to send text to LCD display
 
 //Declare function prototypes (Reference: http://arduino.cc/forum/index.php/topic,87155.0.html)
 void BlinkLED(int LEDtoBlink);
@@ -238,8 +238,8 @@ void setup()
   time_t t = getNtpTime();
   setTime(hour(t),minute(t),second(t),month(t),day(t),year(t));
 
-  char timebuf[20];
-  sprintf(timebuf, "Time: %02d:%02d:%02d", hour(t),minute(t),second(t));
+  char timebuf[16];
+  sprintf(timebuf, "Time: %02d:%02d:%02d", hour(),minute(),second());
   Serial.println(timebuf);
 
   // create the time events
@@ -250,9 +250,12 @@ void setup()
   // Function will compare EEPROM to number passed to it and use the higher one
   GetMeterReadingFromEEPROM(92458);
   
+  setupOled();  // Initialize OLED display
+  
   attachInterrupt(0, ReadPulse, FALLING);  // http://arduino.cc/en/Reference/AttachInterrupt
-  Serial.print(F("End setup "));
-  freeRam(true);  // Printout free ram available
+  dispText("End setup ", 2, true);
+  sprintf(lcdBuff, "Free RAM = &d", freeRam(false));
+  dispText(lcdBuff, 3, false);  // Printout free ram available
 
 } // End Setup()
 
@@ -302,10 +305,6 @@ void loop()
         cosmConnectionOK = false;
         failures++;
     }
-    
-    char timebuf[20];
-    sprintf(timebuf, "Time: %02d:%02d:%02d", hour(),minute(),second());
-    Serial.println(timebuf);
     
   } // end upload to cosm 
   
