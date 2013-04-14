@@ -1,13 +1,25 @@
 /* ==============================
 This version uses COSM.h library to upload data.  
+Version 3
 
 To do:
-* Use an interrupt pin to ream meter pulse
 * Get Time from NTP server  
 * Use clock or timer library to reset things at midnight
 * Make a stream for gas price and have the sketch read price from this
 * Add LEDs to indicate status
 * Add LCD Display to indicate activity: Pulse received, Successful upload to COSM, etc
+
+=== When you create PCB shield ===
+one button to increase, another to decrease
+Status LEDs: heartbeat (grn), pulse in (amber)
+Pin 8 for ethernet shield reset - use jumper so you can disable if using newer board
+Terminal block for I2C, Power, Pulse in
+two 3-position screw terminals incase you want to measure gas temp and pressure in the future.  
+  Just have some wire pads you can solder with jumpers if you decide to use
+Shield reset button
+Arduino reset button
+Power switch
+Header to plug LCD into
 
 
  Hardware: 
@@ -94,18 +106,21 @@ COSM Datastreams:
 #include <tokens.h>     // COSM API key
 
 #define PRER3ETHERNETSHLD // comment out if using R3 or later shield.  Older shields need a hard reset after power up
+#define CRESTVIEW         // If at Crestview, change IP, Feed ID and use internal pull-up resistors
 
-#define COSM_FEED_ID       4663     // Test feed http://cosm.com/feeds/4663
-// #define COSM_FEED_ID       4038     // coms feed ID, http://cosm.com/feeds/4038
 
 #define UPDATE_INTERVAL         20000   // If the connection is good wait 15 seconds before updating again - should not be less than 5 seconds per cosm requirements
 #define EEPROM_ADDR_GASPULSE        0   // Location in EEPROM where gas pulse will be saved (0-512 bytes)
 
 // Network
 byte mac[] = { 0x90, 0xA2, 0xDA, 0xEF, 0xFE, 0x82 }; // Assign MAC Address to ethernet shield
-
-// byte ip[] = { 192, 168, 46, 94 };  // Vermont IP
-byte ip[] = { 192, 168, 216, 53 };  // Crestview IP
+#ifdef CRESTVIEW
+  #define COSM_FEED_ID       4663     // Test feed http://cosm.com/feeds/4663
+  byte ip[] = { 192, 168, 216, 53 };  // Crestview IP
+#else
+  #define COSM_FEED_ID       4038     // cosm feed ID, http://cosm.com/feeds/4038
+  byte ip[] = { 192, 168, 46, 94 };  // Vermont IP
+#endif
 
 uint8_t successes = 0;     // Cosm upload success counter, using a byte will make counter rollover at 255, which is what we want
 uint8_t failures  = 0;     // Cosm upload failure counter
@@ -125,11 +140,11 @@ uint32_t MeterStartDay =            0;    // Meter reading at begenning of day
     byte ProtoShldBtnState_last = LOW;    // current state of button on ProtoWireSheild connected to A5
 
 // I/O Pins
-#define GasMeterPulsePin      2   // digital pin 2 input from pulse on gas meter
+#define GasMeterPulsePin      2   // digital pin 2 input from pulse on gas meter, interrupt int.0
 #define GasMeterLEDPin        3   // digital pin 3 to light LED when pulse is active
 #define ledHeartbeatPin       4   // LED flashes quickly twice to indicate programming is not frozen 
 #define ResetEthernetPin      8   // Reset Ethernet shield
-#define ProtoWireShieldBtn    5   // Button on protoshield PC board - decreases pulse meter count
+#define ProtoWireShieldBtn    5   // Analog Input connected to button on protoshield - decreases pulse meter count
 
 
 
@@ -180,15 +195,20 @@ void CalculateThermUsage();
 // ==============================================================================================================================================
 void setup()
 {
+  
   Serial.begin(9600);  // Need if using serial monitor
   Serial.println(F("Gas Meter v3 Setup"));
   delay(500);
   
   pinMode(GasMeterPulsePin, INPUT);       // Gas meter pulse, define digital as input
-  pinMode(GasMeterLEDPin, OUTPUT);        // LED that lights when gas meter pulse is on
-  pinMode(ledHeartbeatPin, OUTPUT);       // LED flashed every couple seconds to show sketch is running
+  pinMode(GasMeterLEDPin,   OUTPUT);        // LED that lights when gas meter pulse is on
+  pinMode(ledHeartbeatPin,  OUTPUT);       // LED flashed every couple seconds to show sketch is running
   pinMode(ResetEthernetPin, OUTPUT);      // Resets ethernet shield
-  
+
+  #ifdef CRESTVIEW
+    digitalWrite(GasMeterPulsePin, HIGH); // turn on pullup resistors  
+  #endif
+
   #ifdef PRER3ETHERNETSHLD
     // Use Digital I/O to hard reset Ethernet shield
     reset_ethernet_shield(ResetEthernetPin); 
@@ -203,6 +223,7 @@ void setup()
   Serial.print(F("End setup "));
   freeRam(true);  
   
+  attachInterrupt(0, ReadPulse, FALLING);
 } // End Setup()
 
 
@@ -217,7 +238,7 @@ void loop()
   // Turn on LED when pulse is on
   digitalWrite(GasMeterLEDPin, digitalRead(GasMeterPulsePin));
     
-  ReadPulse();  // Read pulse from meter 
+// uses interrupt now  ReadPulse();  // Read pulse from meter 
   ReadDecrementPulseBtn(); // read pulse from decriment pushbutton on shield
   NewDayFlag = CheckForNewDay(); // Checks for New Day
                                  //srg - always returns false until new code for new day can be written
@@ -249,7 +270,7 @@ void loop()
     gasMeterStreams[3].setFloat(yesterdayGasCost);
     gasMeterStreams[4].setInt(successes);
     gasMeterStreams[5].setInt(failures);
-    
+
     int status = cosmclient.put(GasMeterFeed, COSM_API_KEY);
     switch (status)
     {
@@ -302,7 +323,7 @@ void GetMeterReadingFromEEPROM(uint32_t InitializeMeterReading)
 }  // End GetMeterReadingFromEEPROM()
 
 // ==============================================================================================================================================
-//    Read the Gas Meter Pulse input pin or ProtoWireShield button on A5
+//    Read the Gas Meter Pulse input pin 
 // ==============================================================================================================================================
 void ReadPulse()
 {
@@ -321,6 +342,8 @@ void ReadPulse()
           // if the current state is still HIGH then the pulse went from off to on:
           MeterReading++; 
           eeprom_write_dword((uint32_t *)EEPROM_ADDR_GASPULSE, MeterReading); // Save reading to EEPRROM
+          Serial.print(F("Got a pulse: ")); // Srg temp
+          Serial.println(MeterReading);
         }
       }
       pulseState_last = pulseState_now;  // save the current state as the last state, for next time through the loop
@@ -331,7 +354,9 @@ void ReadPulse()
     
 } // End ReadPulse()
 
-// See if button to decrease pulse count was pressed
+// ==============================================================================================================================================
+//    Read ProtoWireShield button on A5, if it's zero, decrement pulse counter
+// ==============================================================================================================================================
 void ReadDecrementPulseBtn()
 {
     // Check for button on ProtoWireShield - when pressed decrease pulse counter by one
