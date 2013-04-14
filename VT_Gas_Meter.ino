@@ -6,7 +6,6 @@ To do:
 * Get Time from NTP server  
 * Use clock or timer library to reset things at midnight
 * Make a stream for gas price and have the sketch read price from this
-* Add LEDs to indicate status
 * Add LCD Display to indicate activity: Pulse received, Successful upload to COSM, etc
 
 === When you create PCB shield ===
@@ -155,6 +154,7 @@ uint32_t MeterStartDay =            0;    // Meter reading at begenning of day
 #define YESTERDAY_GAS_COST    "3"     // Yesterdays propane cost (dollars)
 #define CONNECT_SUCCESSES    "10"     // http connection successes
 #define CONNECT_FAILURES     "11"     // http connection successes
+#define GAS_PRICE_FEED       "12"     // Gas price, this is put in manually into COSM when you get a bill.  Sketch will read value for cost calculation
 #define NUM_STREAMS            6      // Number of cosm streams 
 
 // Setup COSM data stream array
@@ -168,8 +168,14 @@ CosmDatastream gasMeterStreams[] =
   CosmDatastream(CONNECT_FAILURES,  strlen(CONNECT_FAILURES),  DATASTREAM_INT)
 };
 
+CosmDatastream gasCostStream[] = 
+{
+  CosmDatastream(GAS_PRICE_FEED, strlen(GAS_PRICE_FEED), DATASTREAM_FLOAT),
+};
+
 // Wrap the datastreams into a feed
 CosmFeed GasMeterFeed(COSM_FEED_ID, gasMeterStreams, NUM_STREAMS);
+CosmFeed GasCostFeed(COSM_FEED_ID, gasCostStream, 1);
 
 
 bool NewDayFlag = false;     // Flag to indicate new day and calculate daily average
@@ -223,7 +229,7 @@ void setup()
   Serial.print(F("End setup "));
   freeRam(true);  
   
-  attachInterrupt(0, ReadPulse, FALLING);
+  attachInterrupt(0, ReadPulse, FALLING);  // http://arduino.cc/en/Reference/AttachInterrupt
 } // End Setup()
 
 
@@ -232,13 +238,11 @@ void setup()
 // ==============================================================================================================================================
 void loop()
 {
-  
   BlinkLED(ledHeartbeatPin);  // Heartbeat
 
   // Turn on LED when pulse is on
   digitalWrite(GasMeterLEDPin, digitalRead(GasMeterPulsePin));
     
-// uses interrupt now  ReadPulse();  // Read pulse from meter 
   ReadDecrementPulseBtn(); // read pulse from decriment pushbutton on shield
   NewDayFlag = CheckForNewDay(); // Checks for New Day
                                  //srg - always returns false until new code for new day can be written
@@ -275,7 +279,7 @@ void loop()
     switch (status)
     {
       case 200:
-        Serial.print(F("Upload succedded, Success="));
+        Serial.print(F("Upload succeeded, Success="));
         cosmConnectionOK = true;
         Serial.println(successes++);
         failures = 0; // Reset failures
@@ -296,6 +300,21 @@ void loop()
   }
 
 } // End loop()
+
+// ==============================================================================================================================================
+// Read cosm gas price stream.  This stream is updated manually when bills come in
+// This function takes about a minute to process
+// ==============================================================================================================================================
+float GetGasPrice()
+{
+  float oldGasPrice = PropanePrice;
+  int status = cosmclient.get(GasCostFeed, COSM_API_KEY);
+  if (status == 200 )
+  { return GasCostFeed[0].getFloat(); }
+  else
+  { return oldGasPrice; }
+
+}  // end GetGasPrice()
 
 // ==============================================================================================================================================
 // Read gas meter pulses stored in EEPROM
@@ -330,10 +349,10 @@ void ReadPulse()
     pulseState_now = digitalRead(GasMeterPulsePin);
           
     // Compare the pulseState to its previous state
-    if (pulseState_now != pulseState_last) 
+    if ( pulseState_now != pulseState_last ) 
     {
       // if the state has changed, check input one more time, then increment the counter
-      if (pulseState_now == HIGH) 
+      if ( pulseState_now == HIGH ) 
       {
         delay(100);
         pulseState_now = digitalRead(GasMeterPulsePin); // Check input again after 100 mS debounce delay.  If it's still high then increment conter
@@ -342,15 +361,13 @@ void ReadPulse()
           // if the current state is still HIGH then the pulse went from off to on:
           MeterReading++; 
           eeprom_write_dword((uint32_t *)EEPROM_ADDR_GASPULSE, MeterReading); // Save reading to EEPRROM
-          Serial.print(F("Got a pulse: ")); // Srg temp
-          Serial.println(MeterReading);
         }
       }
       pulseState_last = pulseState_now;  // save the current state as the last state, for next time through the loop
     } // End pulse state changed
 
-    
-    if(MeterReading  < 0) {MeterReading  = 0;}
+    if( MeterReading  < 0 ) 
+    { MeterReading  = 0; }
     
 } // End ReadPulse()
 
@@ -361,29 +378,24 @@ void ReadDecrementPulseBtn()
 {
     // Check for button on ProtoWireShield - when pressed decrease pulse counter by one
     if (analogRead(ProtoWireShieldBtn) == 0)
-    {
-      ProtoShldBtnState_now = HIGH;
-    }
+    { ProtoShldBtnState_now = HIGH; }
     else
-    {
-      ProtoShldBtnState_now = LOW;
-    }
+    { ProtoShldBtnState_now = LOW; }
       
     // Compare the current button state to its previous state
     if (ProtoShldBtnState_now != ProtoShldBtnState_last) 
     {
       // if the state has changed, decrement the counter
       if (ProtoShldBtnState_now == HIGH) 
-      {
-        // if the current state is HIGH then the button went from off to on:
+      { // if the current state is HIGH then the button went from off to on:
         MeterReading--;
-        
         eeprom_write_dword((uint32_t *)EEPROM_ADDR_GASPULSE, MeterReading); // Save reading to EEPRROM
       }
       ProtoShldBtnState_last = ProtoShldBtnState_now;  // save the current state as the last state, for next time through the loop
     } // End protowireshield button pulse state changed
 
-    if(MeterReading  < 0) {MeterReading  = 0;}
+    if(MeterReading  < 0) 
+    { MeterReading  = 0; }
   
 }  // end ReadDecrementPulseBtn()
 
@@ -399,12 +411,11 @@ bool CheckForNewDay()
   if (long(millis() - timer24Hours) >=0)
   {
     timer24Hours = millis() + 86400000;
+    PropanePrice = GetGasPrice();  // Get new gas price
     return true;
   }
   else 
-  {
-    return false;
-  }
+  { return false; }
     
 } // End CheckForNewDay()
 
@@ -435,7 +446,7 @@ void CalculateThermUsage()
 
     Meter15MinAgo = MeterReading;
   } 
-  
+
 } // End CalculateThermUsage()
 
 
@@ -468,9 +479,7 @@ void BlinkLED(int LEDtoBlink)
   
   // See if millis() counter rolled over.  If so, reset LEDBlinkStart
   if (millis() <= LEDBlinkStart) 
-  {
-    LEDBlinkStart = millis();
-  }
+  { LEDBlinkStart = millis(); }
   
   if ( millis() <= LEDBlinkStart + LEDBlinkTime[0] ) 
   {
@@ -494,8 +503,6 @@ void BlinkLED(int LEDtoBlink)
   }  
 
 }  // End BlinkLED()
-
-
 
 
 // ==============================================================================================================================================
