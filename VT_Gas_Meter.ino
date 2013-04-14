@@ -3,9 +3,6 @@ This version uses COSM.h library to upload data.
 Version 3
 
 To do:
-* Get Time from NTP server  
-* Use clock or timer library to reset things at midnight
-* Make a stream for gas price and have the sketch read price from this
 * Add LCD Display to indicate activity: Pulse received, Successful upload to COSM, etc
 
 === When you create PCB shield ===
@@ -94,7 +91,8 @@ COSM Datastreams:
             used dtostrf() to round first two streams to 1 decimal.  Added FreeRam function and software reset function. Instead of resetting Ethernet shield
             after 50 upload failures, code reboots after 10 failures.
  4/12/13    Added token.h, replaced erxpachube.h with cosm.h, removed temperature sensors, Removed WDT
-
+ 4/13/13    Sketch reads gas price from cosm stream.  Use interrupt for pulse input, use time libraries to get NTP time and set alarms for midnight stat calculation and 15 minute therm calculation
+ 
 */
 
 #include <SPI.h>        // Required for Ethernet as of Arduino 0021, ref: http://arduino.cc/en/Reference/SPI
@@ -103,8 +101,12 @@ COSM Datastreams:
 #include <avr/eeprom.h> // Functions to read/write EEPROM
 #include <Cosm.h>       // http://github.com/cosm/cosm-arduino
 #include <tokens.h>     // COSM API key
+#include <Time.h>       // http://www.pjrc.com/teensy/td_libs_Time.html#ntp
+#include <TimeAlarms.h> // http://code.google.com/p/arduino-time/source/browse/trunk/TimeAlarms/
+#include <EthernetUdp.h>// core library
 
-#define PRER3ETHERNETSHLD // comment out if using R3 or later shield.  Older shields need a hard reset after power up
+
+// #define PRER3ETHERNETSHLD // comment out if using R3 or later shield.  Older shields need a hard reset after power up
 #define CRESTVIEW         // If at Crestview, change IP, Feed ID and use internal pull-up resistors
 
 
@@ -120,6 +122,15 @@ byte mac[] = { 0x90, 0xA2, 0xDA, 0xEF, 0xFE, 0x82 }; // Assign MAC Address to et
   #define COSM_FEED_ID       4038     // cosm feed ID, http://cosm.com/feeds/4038
   byte ip[] = { 192, 168, 46, 94 };  // Vermont IP
 #endif
+
+// Setup variables for time and alarm functions
+IPAddress timeServer(132, 163, 4, 101); // time-a.timefreq.bldrdoc.gov
+// IPAddress timeServer(132, 163, 4, 102); // time-b.timefreq.bldrdoc.gov
+// IPAddress timeServer(132, 163, 4, 103); // time-c.timefreq.bldrdoc.gov
+const int timeZone = -5;  // Eastern Standard Time (USA)
+EthernetUDP Udp;
+unsigned int localPort = 8888;  // local port to listen for UDP packets
+
 
 uint8_t successes = 0;     // Cosm upload success counter, using a byte will make counter rollover at 255, which is what we want
 uint8_t failures  = 0;     // Cosm upload failure counter
@@ -177,8 +188,6 @@ CosmDatastream gasCostStream[] =
 CosmFeed GasMeterFeed(COSM_FEED_ID, gasMeterStreams, NUM_STREAMS);
 CosmFeed GasCostFeed(COSM_FEED_ID, gasCostStream, 1);
 
-
-bool NewDayFlag = false;     // Flag to indicate new day and calculate daily average
 byte cosmConnectionOK = true; // If sketch is connecting to cosm ok, then set this to true, if not, set to false and change blinking on green LED
 
 
@@ -193,8 +202,8 @@ void GetMeterReadingFromEEPROM(uint32_t InitializeMeterReading);
 void reset_ethernet_shield(int ResettPin);
 void ReadPulse();
 void ReadDecrementPulseBtn();
-bool CheckForNewDay();
-void CalculateThermUsage();
+void calcThermUsage();
+void calcYesterdayStats();
 
 // ==============================================================================================================================================
 //   Setup
@@ -205,7 +214,7 @@ void setup()
   Serial.begin(9600);  // Need if using serial monitor
   Serial.println(F("Gas Meter v3 Setup"));
   delay(500);
-  
+
   pinMode(GasMeterPulsePin, INPUT);       // Gas meter pulse, define digital as input
   pinMode(GasMeterLEDPin,   OUTPUT);        // LED that lights when gas meter pulse is on
   pinMode(ledHeartbeatPin,  OUTPUT);       // LED flashed every couple seconds to show sketch is running
@@ -222,14 +231,29 @@ void setup()
   
   Ethernet.begin(mac, ip);
 
+  Serial.println(Ethernet.localIP());
+  Udp.begin(localPort);
+
+  // Set the time for the alarm functions
+  time_t t = getNtpTime();
+  setTime(hour(t),minute(t),second(t),month(t),day(t),year(t));
+
+  char timebuf[20];
+  sprintf(timebuf, "Time: %02d:%02d:%02d", hour(t),minute(t),second(t));
+  Serial.println(timebuf);
+
+  // create the time events
+  Alarm.alarmRepeat(0,0,0, calcYesterdayStats);   // Midnight every day
+  Alarm.timerRepeat(15*60, calcThermUsage);  // timer for every 15 minutes    
+
   // Get meter reading from EEPROM, if you need sketch to use a new (higher) number, pass that to the function.
   // Function will compare EEPROM to number passed to it and use the higher one
   GetMeterReadingFromEEPROM(92458);
   
-  Serial.print(F("End setup "));
-  freeRam(true);  
-  
   attachInterrupt(0, ReadPulse, FALLING);  // http://arduino.cc/en/Reference/AttachInterrupt
+  Serial.print(F("End setup "));
+  freeRam(true);  // Printout free ram available
+
 } // End Setup()
 
 
@@ -238,27 +262,15 @@ void setup()
 // ==============================================================================================================================================
 void loop()
 {
+  Alarm.delay(0); //  Alarm.delay must be used instead of the usual arduino delay function because the alarms are 
+                  // serviced in the Alarm.delay method.
+  
   BlinkLED(ledHeartbeatPin);  // Heartbeat
 
   // Turn on LED when pulse is on
   digitalWrite(GasMeterLEDPin, digitalRead(GasMeterPulsePin));
     
   ReadDecrementPulseBtn(); // read pulse from decriment pushbutton on shield
-  NewDayFlag = CheckForNewDay(); // Checks for New Day
-                                 //srg - always returns false until new code for new day can be written
-
-  if (NewDayFlag == true)  
-  {
-    Serial.println(F("New Day started")); 
-    
-    // Calculate gas usage and cost for previous day
-    GasCuFtYesterday = MeterReading - MeterStartDay;
-    MeterStartDay = MeterReading;
-    if(GasCuFtYesterday > 1000 || GasCuFtYesterday < 0) {GasCuFtYesterday = 0;}
-    yesterdayGasCost = GasCuFtYesterday * 0.02549 * PropanePrice;
-  }
-
-  CalculateThermUsage();  // Calculate therms used
 
   //--------------------------------
   // Send data to Cosm
@@ -290,6 +302,11 @@ void loop()
         cosmConnectionOK = false;
         failures++;
     }
+    
+    char timebuf[20];
+    sprintf(timebuf, "Time: %02d:%02d:%02d", hour(),minute(),second());
+    Serial.println(timebuf);
+    
   } // end upload to cosm 
   
   // if connection failures reach 10, reboot 
@@ -300,6 +317,23 @@ void loop()
   }
 
 } // End loop()
+
+// ==============================================================================================================================================
+// Called by alarm library at midnight
+// ==============================================================================================================================================
+void calcYesterdayStats()
+{
+  Serial.println(F("New Day started")); 
+
+  PropanePrice = GetGasPrice();  // Get new gas price
+    
+  // Calculate gas usage and cost for previous day
+  GasCuFtYesterday = MeterReading - MeterStartDay;
+  MeterStartDay = MeterReading;
+  if(GasCuFtYesterday > 1000 || GasCuFtYesterday < 0) {GasCuFtYesterday = 0;}
+  yesterdayGasCost = GasCuFtYesterday * 0.02549 * PropanePrice;
+ 
+}  // calcYesterdayStats()
 
 // ==============================================================================================================================================
 // Read cosm gas price stream.  This stream is updated manually when bills come in
@@ -400,40 +434,21 @@ void ReadDecrementPulseBtn()
 }  // end ReadDecrementPulseBtn()
 
 
-// ==============================================================================================================================================
-//  Check for a new day. If it's a new day then calculate stats from previous day
-//  Don't have actual time any more, so just use a 24 hour timer
-// ==============================================================================================================================================
-bool CheckForNewDay()
-{
-  static uint32_t timer24Hours;
-
-  if (long(millis() - timer24Hours) >=0)
-  {
-    timer24Hours = millis() + 86400000;
-    PropanePrice = GetGasPrice();  // Get new gas price
-    return true;
-  }
-  else 
-  { return false; }
-    
-} // End CheckForNewDay()
-
 
 // ==============================================================================================================================================
 //  Calculate therms used in the last 15 minutes
 // ==============================================================================================================================================
-void CalculateThermUsage()  
+void calcThermUsage()  
 { 
   //------------------------------------
   // Check for new 15 minute interval
   // Calculate BHU/hour and avg temperatures
   //------------------------------------
-  static uint32_t FifteenMinTimer;
+//  static uint32_t FifteenMinTimer;
 
-  if (long(millis() - FifteenMinTimer) >=0)
-  {
-    FifteenMinTimer = millis() + 900000;  // add 15 minutes to timer
+//  if (long(millis() - FifteenMinTimer) >=0)
+//  {
+//    FifteenMinTimer = millis() + 900000;  // add 15 minutes to timer
     therms = (MeterReading - Meter15MinAgo) * 2328.0 * 4.0 / 100000.0;   // convert cu-ft used to BTU (2328) then multiply by 4 to convert from 15 minutes to hours
     
     if(therms >  100 || therms < 0) {therms = 0;}
@@ -445,9 +460,9 @@ void CalculateThermUsage()
     Serial.println(therms);
 
     Meter15MinAgo = MeterReading;
-  } 
+//  } 
 
-} // End CalculateThermUsage()
+} // End calcThermUsage()
 
 
 // ==============================================================================================================================================
@@ -475,7 +490,6 @@ void BlinkLED(int LEDtoBlink)
     LEDBlinkTime[2] = 750;
     LEDBlinkTime[3] = 1000;
   }
-  
   
   // See if millis() counter rolled over.  If so, reset LEDBlinkStart
   if (millis() <= LEDBlinkStart) 
@@ -505,6 +519,54 @@ void BlinkLED(int LEDtoBlink)
 }  // End BlinkLED()
 
 
+/*-------- NTP code ----------*/
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+time_t getNtpTime()
+{
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+  sendNTPpacket(timeServer);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+    }
+  }
+  return 0; // return 0 if unable to get the time
+}  // end getNtpTime()
+
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress &address)
+{
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:                 
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+} // end sendNTPpacket()
+
+
 // ==============================================================================================================================================
 // The ethernet shield can be reset with one of the digital I/O pins
 // ==============================================================================================================================================
@@ -521,8 +583,6 @@ void reset_ethernet_shield(int ResettPin)
   delay(100);
   
 }  // End reset_ethernet_shield()
-
-
 
 
 //==========================================================================================================================
